@@ -1,1 +1,1 @@
-package hub_test
+package hub
