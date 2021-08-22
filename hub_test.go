@@ -1,20 +1,22 @@
-package hub
+package hub_test
 
 import (
 	"fmt"
 	"sync"
+
+	"github.com/tmaxmax/hub"
 )
 
 func ExampleNew() {
-	hub := New()
+	h := hub.New()
 	// Create two topics. You can pass a buffer size to make if you desire.
-	topicA, topicB := make(Topic), make(Topic)
+	topicA, topicB := make(hub.Topic), make(hub.Topic)
 	// Register the two topics. You must send them to Hub before broadcasting messages on the topics!
-	hub <- topicA
-	hub <- topicB
+	h <- topicA
+	h <- topicB
 
 	// Create a connection.
-	conn := make(Conn)
+	conn := make(hub.Conn)
 	// Subscribe to both topics with the same connection
 	topicA <- conn
 	topicB <- conn
@@ -39,9 +41,9 @@ func ExampleNew() {
 	topicB <- "Hello from B"
 
 	// Close a single topic. Do not close the topic channel yourself!
-	hub <- RemoveTopic(topicA)
+	h <- hub.RemoveTopic(topicA)
 	// Close the hub channel. This will close all topics and connections
-	close(hub)
+	close(h)
 
 	wg.Wait()
 
