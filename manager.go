@@ -1,7 +1,7 @@
 package hub
 
 type (
-	counter      int
+	counter      Number
 	connRefCount struct {
 		topics   counter
 		messages counter
@@ -13,7 +13,7 @@ type (
 	}
 )
 
-func newCounter(init int) *counter {
+func newCounter(init Number) *counter {
 	v := counter(init)
 	return &v
 }
@@ -34,11 +34,18 @@ func (c *counter) dec() bool {
 }
 
 // reset sets the counter's value if the given value is positive or 0.
-func (c *counter) reset(init int) {
+func (c *counter) reset(init Number) {
 	if init < 0 {
 		return
 	}
 	*c = counter(init)
+}
+
+func getTopics(initial []Topic, defaultIfNone bool) []Topic {
+	if defaultIfNone && len(initial) == 0 {
+		return []Topic{nil}
+	}
+	return initial
 }
 
 func newManager() *manager {
@@ -101,11 +108,18 @@ func (m *manager) connectEach(c *ConnectEach) {
 	}
 }
 
-func (m *manager) removeConnFromTopicNoRefCounter(t Topic, c Conn) {
+func (m *manager) removeConnFromTopicNoRefCounter(t Topic, c Conn) bool {
+	prevLen := len(m.topics[t])
 	delete(m.topics[t], c)
-	if len(m.topics[t]) == 0 {
+	currLen := len(m.topics[t])
+
+	if prevLen == currLen {
+		return false
+	} else if currLen == 0 {
 		delete(m.topics, t)
 	}
+
+	return true
 }
 
 func (m *manager) removeConnFromTopicRefCountOnly(c Conn) bool {
@@ -116,46 +130,58 @@ func (m *manager) removeConnFromTopicRefCountOnly(c Conn) bool {
 			close(c)
 		}
 
-		return false
+		return true
 	}
 
-	return true
+	return false
 }
 
 // removeConnFromTopic deletes the connection from the given topic and deletes the topic if it has no connections.
 // Then it decrements the connection's topic counter and deletes the connection if it isn't connected to any topics.
 // It also closes the connection channel if at connection KeepAlive wasn't specified. It returns true if the
-// connection still exists after removal.
+// connection was removed.
 func (m *manager) removeConnFromTopic(t Topic, c Conn) bool {
-	m.removeConnFromTopicNoRefCounter(t, c)
+	if !m.removeConnFromTopicNoRefCounter(t, c) {
+		return false
+	}
 	return m.removeConnFromTopicRefCountOnly(c)
 }
 
-func (m *manager) disconnect(d *Disconnect) {
-	c := d.Conn
-	_, ok := m.conns[c]
+func (m *manager) disconnectAll(d DisconnectAll) {
+	c := Conn(d)
+	ref, ok := m.conns[c]
 	if !ok {
 		return
 	}
 
-	close(c)
+	if !ref.keep {
+		close(c)
+	}
 	delete(m.conns, c)
 
-	if len(d.Topics) == 0 {
-		for t := range m.topics {
-			m.removeConnFromTopicNoRefCounter(t, c)
+	for t := range m.topics {
+		m.removeConnFromTopicNoRefCounter(t, c)
+	}
+}
+
+func (m *manager) disconnect(d *Disconnect) {
+	if _, ok := m.conns[d.Conn]; !ok {
+		return
+	}
+
+	for _, t := range getTopics(d.Topics, true) {
+		if _, ok := m.topics[t]; !ok {
+			continue
 		}
-	} else {
-		for _, t := range d.Topics {
-			m.removeConnFromTopicNoRefCounter(t, c)
+
+		if m.removeConnFromTopic(t, d.Conn) {
+			break
 		}
 	}
 }
 
 func (m *manager) closeTopics(c Close) {
-	topics := []Topic(c)
-
-	for _, t := range topics {
+	for _, t := range getTopics(c, true) {
 		conns, ok := m.topics[t]
 		if !ok {
 			continue
@@ -168,25 +194,26 @@ func (m *manager) closeTopics(c Close) {
 	}
 }
 
-func (m *manager) message(msg *Message) {
-	topics := msg.Topics
-	if len(topics) == 0 {
-		topics = []Topic{nil}
+func (m *manager) closeAllTopics() {
+	for t, conns := range m.topics {
+		delete(m.topics, t)
+		for c := range conns {
+			m.removeConnFromTopicRefCountOnly(c)
+		}
 	}
+}
 
-	for _, t := range topics {
-		for c := range m.topics[t] {
+func (m *manager) message(msg *Message) {
+	for _, t := range getTopics(msg.Topics, true) {
+		for c, cnt := range m.topics[t] {
 			c <- msg.Message
 
-			exists := true
-			if m.topics[t][c].dec() {
-				exists = m.removeConnFromTopic(t, c)
-			}
-
-			if exists && m.conns[c].messages.dec() {
+			if m.conns[c].messages.dec() {
 				for t := range m.topics {
 					m.removeConnFromTopic(t, c)
 				}
+			} else if cnt.dec() {
+				m.removeConnFromTopic(t, c)
 			}
 		}
 	}
