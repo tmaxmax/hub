@@ -1,3 +1,7 @@
+/*
+Package hub provides primitives for working with the publish-subscribe messaging model.
+All the types are Go channels, so the usage is identical to theirs.
+*/
 package hub
 
 type (
@@ -18,10 +22,10 @@ type (
 	//   topic := make(Topic) // you can use a buffered channel too
 	//   // register to a hub
 	//   conn := make(Conn)
-	//   topic <- conn // the connection will receive all messages broadcasted to the topic
-	//   topic <- Disconnect(conn) // the connection will stop receiving messages from this topic
+	//   topic <- conn // the Connect will receive all messages broadcasted to the topic
+	//   topic <- Disconnect(conn) // the Connect will stop receiving messages from this topic
 	//
-	// See altso the New example.
+	// See also the New example.
 	Topic chan interface{}
 	// The Conn channel is used for receiving messages from the topics it's connected to.
 	//
@@ -31,13 +35,26 @@ type (
 	//     fmt.Println(message)
 	//   }
 	//
-	// See the examples for Topic and New for usage.
+	// Sending a Conn to a topic directly can be seen as a shorthand for
+	//
+	//   topic <- Connect{Conn: conn}
+	//
+	// Also see the package examples for usage.
 	Conn chan interface{}
+	// The Connect struct is a message that signals a topic to start sending messages to a connection.
+	// If MessageCount is provided, the given topic will disconnect the connection after it has sent
+	// that number of messages to it.
+	Connect struct {
+		// The number of messages the topic should send to the Conn.
+		MessageCount int
+		// The connection the topic should send messages to.
+		Conn Conn
+	}
 	// The Disconnect type is a Conn that when sent to a Topic it tells that Topic to stop sending the given Conn
-	// messages. See the Topic and New examples for usage.
+	// messages.
 	Disconnect Conn
 	// The RemoveTopic type is a Topic that when sent to a Hub it tells that Hub to close the given Topic. Broadcasting
-	// new messages won't work after this. See the Topic and New examples for usage.
+	// new messages won't work after this. See the package examples for usage.
 	RemoveTopic Topic
 
 	refCounter chan interface{}
@@ -54,6 +71,12 @@ func New() Hub {
 
 func (r refCounter) start(done chan struct{}) {
 	conns := map[Conn]uint64{}
+	getDone := func() chan struct{} {
+		if len(conns) > 0 {
+			return nil
+		}
+		return done
+	}
 
 	for {
 		select {
@@ -69,10 +92,8 @@ func (r refCounter) start(done chan struct{}) {
 					delete(conns, c)
 				}
 			}
-		case <-done:
-			if len(conns) == 0 {
-				return
-			}
+		case <-getDone():
+			return
 		}
 	}
 }
@@ -99,6 +120,9 @@ func (h Hub) start() {
 			panic("hub: Hub: message not supported")
 		}
 	}
+	// TODO: Data race between topics senders and hub when hub is closing the topics.
+	// Find a way to close the topics automatically when the hub closes without
+	// the hub's goroutine closing them.
 	for t := range topics {
 		close(t)
 	}
@@ -107,22 +131,43 @@ func (h Hub) start() {
 }
 
 func (t Topic) start(rc refCounter) {
-	conns := map[Conn]struct{}{}
+	conns := map[Conn]int{}
+	connect := func(c Connect) {
+		if _, ok := conns[c.Conn]; ok {
+			return
+		}
+		conns[c.Conn] = c.MessageCount
+		rc <- c.Conn
+	}
 
 	for cmd := range t {
 		switch v := cmd.(type) {
 		case Conn:
-			if _, ok := conns[v]; ok {
+			connect(Connect{Conn: v})
+		case Connect:
+			connect(v)
+		case Disconnect:
+			c := Conn(v)
+			if _, ok := conns[c]; !ok {
 				break
 			}
-			conns[v] = struct{}{}
-			rc <- v
-		case Disconnect:
-			delete(conns, Conn(v))
+			delete(conns, c)
 			rc <- v
 		default:
-			for c := range conns {
+			for c, msgCount := range conns {
 				c <- v
+				if msgCount == 0 {
+					// this conn receives an indefinite number of messages
+					continue
+				}
+				msgCount--
+				if msgCount == 0 {
+					// this conn received all the messages requested
+					delete(conns, c)
+					rc <- Disconnect(c)
+				} else {
+					conns[c] = msgCount
+				}
 			}
 		}
 	}
