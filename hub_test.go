@@ -1,220 +1,359 @@
 package hub_test
 
 import (
-	"context"
-	"fmt"
-	"math/rand"
-	"sort"
-	"sync"
-	"time"
+	"reflect"
+	"testing"
 
 	"github.com/tmaxmax/hub"
 )
 
-func Example() {
-	h := hub.New()
-	conn := h.Connect()
+func checkContents(tb testing.TB, c hub.Conn, expected ...interface{}) {
+	tb.Helper()
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	var got []interface{}
+	for v := range c {
+		got = append(got, v)
+	}
 
-	go func() {
-		defer wg.Done()
-
-		for msg := range conn {
-			fmt.Println(msg)
-		}
-		fmt.Println("Done!")
-	}()
-
-	h.Send("Hello")
-	h.Send("It's nice to see you")
-	h.Send("I'll leave now")
-	h.Stop()
-
-	wg.Wait()
-
-	// Output:
-	// Hello
-	// It's nice to see you
-	// I'll leave now
-	// Done!
+	if !reflect.DeepEqual(got, expected) {
+		tb.Fatalf("Invalid channel contents.\nExpected %#v\nGot %#v", expected, got)
+	}
 }
 
-func Example_raw() {
-	h, conn := make(hub.Hub), make(hub.Conn)
+func assertPanic(tb testing.TB, message string, f func()) {
+	tb.Helper()
 
-	go h.Start()
-	h <- hub.Connect{Conn: conn}
-
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		for msg := range conn {
-			fmt.Println(msg)
-		}
-		fmt.Println("Done!")
+	defer func() {
+		_ = recover()
 	}()
 
-	h <- "Hello"
-	h <- "It's nice to see you"
-	h <- "I'll leave now"
+	f()
+	tb.Fatal(message)
+}
+
+func TestMessageInexistentTopic(t *testing.T) {
+	h, done := hub.New()
+	h <- hub.Message{Topics: []hub.Topic{"A"}}
 	close(h)
-
-	wg.Wait()
-
-	// Output:
-	// Hello
-	// It's nice to see you
-	// I'll leave now
-	// Done!
+	<-done
 }
 
-func Example_oneFromEachTopic() {
-	h := hub.New()
-	conn := make(hub.Conn)
+func TestConnDefault(t *testing.T) {
+	h, done := hub.New()
+	conn := make(hub.Conn, 1)
 
+	h <- hub.Connect{Conn: conn}
+	h.Send("Hello world!")
+
+	close(h)
+	<-done
+
+	checkContents(t, conn, "Hello world!")
+}
+
+func TestConnTopics(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B"}
+	conn := make(hub.Conn, len(topics))
+
+	h <- hub.Connect{Conn: conn, Topics: topics}
+	h <- hub.Message{Message: "Hello world!", Topics: topics}
+	close(h)
+	<-done
+
+	checkContents(t, conn, "Hello world!", "Hello world!")
+}
+
+func TestDisconnect(t *testing.T) {
+	h, done := hub.New()
+	conn := make(hub.Conn, 1)
+
+	h <- conn
+	h <- "Hello world!"
+	h <- hub.Disconnect{Conn: conn}
+	h <- "This should not be received"
+	close(h)
+	<-done
+
+	checkContents(t, conn, "Hello world!")
+}
+
+func TestDisconnectTopics(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B", "C"}
+	conn := make(hub.Conn, len(topics)+1)
+
+	h <- hub.Connect{Conn: conn, Topics: topics}
+	h <- hub.Message{Message: "Hello world!", Topics: topics}
+	h.Disconnect(conn, topics[:2]...)
+	h <- hub.Message{Message: "Hello again!", Topics: topics}
+	close(h)
+	<-done
+
+	checkContents(t, conn, "Hello world!", "Hello world!", "Hello world!", "Hello again!")
+}
+
+func TestDisconnectInvalidConn(t *testing.T) {
+	h, done := hub.New()
+	h <- hub.Disconnect{}
+	close(h)
+	<-done
+}
+
+func TestDisconnectInvalidOrNotConnectedTopics(t *testing.T) {
+	h, done := hub.New()
+	a, b := make(hub.Conn, 3), make(hub.Conn, 4)
+
+	h <- hub.Connect{Conn: a, Topics: []hub.Topic{"A", "B"}}
+	h <- hub.Connect{Conn: b, Topics: []hub.Topic{"A", "C"}}
+	h <- hub.Message{Message: "First", Topics: []hub.Topic{"A", "B", "C"}}
+	h <- hub.Disconnect{Conn: a, Topics: []hub.Topic{"A", "C", "D"}}
+	h <- hub.Message{Message: "Second", Topics: []hub.Topic{"A", "B", "C"}}
+
+	close(h)
+	<-done
+
+	checkContents(t, a, "First", "First", "Second")
+	checkContents(t, b, "First", "First", "Second", "Second")
+}
+
+func TestConnKeepAlive(t *testing.T) {
+	h, done := hub.New()
+	conn := make(hub.Conn, 2)
+
+	h <- hub.Connect{Conn: conn, KeepAlive: true}
+	h <- "Hello world!"
+	h <- hub.Disconnect{Conn: conn}
+	h <- "Hello again!"
+	conn <- "Hello there!"
+	close(h)
+	<-done
+	close(conn)
+
+	checkContents(t, conn, "Hello world!", "Hello there!")
+}
+
+func TestDisconnectAll(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B"}
+	a, b := make(hub.Conn, 1), make(hub.Conn, 3)
+
+	h <- hub.Connect{Conn: a, Topics: topics[:1]}
+	h <- hub.Connect{Conn: b, Topics: topics, KeepAlive: true}
+	h <- hub.Message{Message: "First", Topics: topics}
+	h <- hub.DisconnectAll(a)
+	h <- hub.DisconnectAll(b)
+	h.DisconnectAll(nil)
+	h <- hub.Message{Message: "Second", Topics: topics}
+	b <- "This is for you only!"
+	close(h)
+	<-done
+	close(b)
+
+	checkContents(t, a, "First")
+	checkContents(t, b, "First", "First", "This is for you only!")
+}
+
+func TestCappedMessages(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B", "C"}
+	limit := 5
+	conn := make(hub.Conn, limit)
+
+	h <- hub.Connect{
+		Conn:         conn,
+		Topics:       topics,
+		MessageCount: limit,
+	}
+	h <- hub.Message{Message: "First", Topics: topics}
+	h <- hub.Message{Message: "Second", Topics: topics}
+	close(h)
+	<-done
+
+	checkContents(t, conn, "First", "First", "First", "Second", "Second")
+}
+
+func TestCappedMessagesPerTopic(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B", "C"}
+	topicConns := []hub.TopicConn{
+		{Topic: "A", MessageCount: 1},
+		{Topic: "B", MessageCount: 2},
+		{Topic: "C", MessageCount: 3},
+	}
+	conn := make(hub.Conn, 6)
+
+	h <- hub.ConnectEach{
+		Conn:   conn,
+		Topics: topicConns,
+	}
+	h <- hub.Message{Message: "First", Topics: topics}
+	h <- hub.Message{Message: "Second", Topics: topics}
+	h <- hub.Message{Message: "Third", Topics: topics}
+	close(h)
+	<-done
+
+	checkContents(t, conn, "First", "First", "First", "Second", "Second", "Third")
+}
+
+func TestCappedMessagesCombined(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B"}
+	topicConns := []hub.TopicConn{
+		{Topic: "A", MessageCount: 1},
+		{Topic: "B", MessageCount: 2},
+	}
+	a, b := make(hub.Conn, 2), make(hub.Conn, 3)
+
+	h <- hub.ConnectEach{
+		Conn:         a,
+		Topics:       topicConns,
+		MessageCount: 2,
+	}
+	h <- hub.ConnectEach{
+		Conn:         b,
+		Topics:       topicConns,
+		MessageCount: 4,
+	}
+	h <- hub.Message{Message: "First", Topics: topics}
+	h <- hub.Message{Message: "Second", Topics: topics}
+	close(h)
+	<-done
+
+	checkContents(t, a, "First", "First")
+	checkContents(t, b, "First", "First", "Second")
+}
+
+func TestCloseTopics(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B"}
+	a, b, c := make(hub.Conn), make(hub.Conn, 1), make(hub.Conn, 1)
+
+	h <- hub.Connect{
+		Conn:   a,
+		Topics: topics[:1],
+	}
+	h <- hub.Connect{
+		Conn:   b,
+		Topics: topics[1:],
+	}
+	h <- hub.Connect{
+		Conn:      c,
+		Topics:    topics[:1],
+		KeepAlive: true,
+	}
+	h.Close(topics[:1]...)
+	h <- hub.Message{Message: "From hub", Topics: topics}
+	c <- "For C only"
+	close(h)
+	<-done
+	close(c)
+
+	assertPanic(t, "Channel a should have been closed by Hub", func() {
+		close(a)
+	})
+	checkContents(t, b, "From hub")
+	checkContents(t, c, "For C only")
+}
+
+func TestCloseDefaultTopic(t *testing.T) {
+	h, done := hub.New()
+	conn := h.Connect()
+	h.Close()
+	close(h)
+	<-done
+
+	assertPanic(t, "Channel should have been closed by Hub", func() {
+		close(conn)
+	})
+}
+
+func TestCloseInexistentTopic(t *testing.T) {
+	h, done := hub.New()
+	h.Close("lol")
+	close(h)
+	<-done
+}
+
+func TestCloseAllTopics(t *testing.T) {
+	h, done := hub.New()
+	topics := []hub.Topic{"A", "B"}
+	a := h.Connect(topics...)
+	b := make(hub.Conn, 1)
+
+	h <- hub.Connect{
+		Conn:      b,
+		Topics:    topics,
+		KeepAlive: true,
+	}
+	h <- hub.CloseAll{}
+	h <- hub.Message{Message: "From hub", Topics: topics}
+	close(h)
+	<-done
+
+	b <- "For B only"
+	close(b)
+
+	assertPanic(t, "Channel A should have been closed by hub", func() {
+		close(a)
+	})
+	checkContents(t, b, "For B only")
+}
+
+func TestOverwriteConnectionProperties(t *testing.T) {
+	h, done := hub.New()
+	conn := make(hub.Conn, 13)
+
+	h <- hub.Connect{
+		Conn:         conn,
+		MessageCount: 2,
+	}
+	h <- "First"
 	h <- hub.ConnectEach{
 		Conn: conn,
 		Topics: []hub.TopicConn{
-			{Topic: "positiveNumbers", MessageCount: 1},
-			{Topic: "negativeNumbers", MessageCount: 1},
-			{Topic: "zeroes", MessageCount: 1},
+			{Topic: "A", MessageCount: 3},
+			{Topic: "B", MessageCount: 2},
 		},
+		MessageCount: 7,
 	}
-
-	wg := sync.WaitGroup{}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	worker := func(topic string, gen func() int) {
-		defer wg.Done()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(rand.Intn(200)) * time.Millisecond):
-				h <- hub.Message{
-					Message: gen(),
-					Topics:  []hub.Topic{topic},
-				}
-			}
-		}
+	h <- hub.Message{Message: "Second", Topics: []hub.Topic{"A", "B"}}
+	h <- hub.ConnectEach{
+		Conn:         conn,
+		Topics:       []hub.TopicConn{{Topic: "A", MessageCount: 2}},
+		MessageCount: -1,
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		var messages []int
-
-		for msg := range conn {
-			messages = append(messages, msg.(int))
-		}
-
-		sort.Ints(messages)
-
-		fmt.Printf("Received %d messages\n", len(messages))
-		if len(messages) == 3 {
-			if messages[0] < 0 {
-				fmt.Println("One smaller than 0")
-			}
-			if messages[1] == 0 {
-				fmt.Println("One equal to 0")
-			}
-			if messages[2] > 0 {
-				fmt.Println("One greater than 0")
-			}
-		}
-	}()
-
-	wg.Add(3)
-	go worker("positiveNumbers", func() int {
-		return rand.Int() + 1
-	})
-	go worker("negativeNumbers", func() int {
-		return -rand.Int() - 1
-	})
-	go worker("zeroes", func() int {
-		return 0
-	})
-
-	<-ctx.Done()
-	wg.Wait()
-
+	h <- hub.Message{Message: "Third", Topics: []hub.Topic{"A", "B"}}
+	h <- hub.Message{Message: "Fourth", Topics: []hub.Topic{"A", "B"}}
+	h <- "Fifth"
+	h <- hub.Connect{
+		Conn:      conn,
+		Topics:    []hub.Topic{"C"},
+		KeepAlive: true,
+	}
+	h <- hub.Message{Message: "Sixth", Topics: []hub.Topic{"C"}}
+	h <- "Seventh"
+	h <- "Eighth"
+	h <- "Ninth"
+	h <- "Tenth"
 	close(h)
+	<-done
 
-	// Output:
-	// Received 3 messages
-	// One smaller than 0
-	// One equal to 0
-	// One greater than 0
+	conn <- "For conn only"
+	close(conn)
+
+	checkContents(
+		t,
+		conn,
+		"First",
+		"Second", "Second",
+		"Third", "Third",
+		"Fourth",
+		"Fifth",
+		"Sixth",
+		"Seventh",
+		"Eighth",
+		"Ninth",
+		"Tenth",
+		"For conn only")
 }
-
-func Example_receiveNFromTopics() {
-	h, connAll, connOne := make(hub.Hub), make(hub.Conn), make(hub.Conn)
-
-	go h.Start()
-	h <- hub.Connect{Conn: connAll, Topics: []hub.Topic{"A", "B"}}
-	h <- hub.Connect{Conn: connOne, Topics: []hub.Topic{"A", "B"}, MessageCount: 1}
-
-	wg := sync.WaitGroup{}
-	connOneMsg := make(chan string, 1)
-	connAllMsgs := make(chan []string, 1)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		connOneMsg <- (<-connOne).(string)
-
-		fmt.Println("connOne done! message received.")
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		var received []string
-		for msg := range connAll {
-			received = append(received, msg.(string))
-		}
-
-		connAllMsgs <- received
-		// no need to disconnect, as the hub will close the conn automatically
-		fmt.Println("connAll done! messages received.")
-	}()
-
-	h <- hub.Message{Message: "Hello from A", Topics: []hub.Topic{"A"}}
-	h <- hub.Message{Message: "Hello from B", Topics: []hub.Topic{"B"}}
-	h <- hub.Message{Message: "Another message from A", Topics: []hub.Topic{"A"}}
-	h <- hub.Message{Message: "Still from A", Topics: []hub.Topic{"A"}}
-	h <- hub.Message{Message: "This message is your warning, hub will be closed", Topics: []hub.Topic{"B"}}
-
-	close(h)
-	wg.Wait()
-
-	oneMsg := <-connOneMsg
-	allMsgs := <-connAllMsgs
-
-	for _, msg := range allMsgs {
-		if oneMsg == msg {
-			fmt.Println("connOne received a message connAll also received!")
-			break
-		}
-	}
-
-	fmt.Printf("connAll received %d/5 messages.", len(allMsgs))
-
-	// Output:
-	// connOne done! message received.
-	// connAll done! messages received.
-	// connOne received a message connAll also received!
-	// connAll received 5/5 messages.
-}
-
-// TODO: Docs and tests
