@@ -13,17 +13,7 @@ import (
 
 func Example() {
 	h := hub.New()
-	// Create two topics. You can pass a buffer size to make if you desire.
-	topicA, topicB := make(hub.Topic), make(hub.Topic)
-	// Register the two topics. You must send them to Hub before broadcasting messages on the topics!
-	h <- topicA
-	h <- topicB
-
-	// Create a Connect.
-	conn := make(hub.Conn)
-	// Subscribe to both topics with the same Connect
-	topicA <- conn
-	topicB <- conn
+	conn := h.Connect()
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
@@ -31,46 +21,76 @@ func Example() {
 	go func() {
 		defer wg.Done()
 
-		// Receive the broadcasted messages. The conn channel is automatically closed
-		// if it is disconnected from all topics.
 		for msg := range conn {
 			fmt.Println(msg)
 		}
 		fmt.Println("Done!")
 	}()
 
-	// Broadcast messages to the two topics
-	topicA <- "Hello from A"
-	topicA <- "It's nice to see you"
-	topicB <- "Hello from B"
+	h.Send("Hello")
+	h.Send("It's nice to see you")
+	h.Send("I'll leave now")
+	h.Stop()
 
-	// Close a single topic. Do not close the topic channel yourself!
-	h <- hub.RemoveTopic(topicA)
-	// Close the hub channel. This will close all topics and connections
+	wg.Wait()
+
+	// Output:
+	// Hello
+	// It's nice to see you
+	// I'll leave now
+	// Done!
+}
+
+func Example_raw() {
+	h, conn := make(hub.Hub), make(hub.Conn)
+
+	go h.Start()
+	h <- hub.Connect{Conn: conn}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for msg := range conn {
+			fmt.Println(msg)
+		}
+		fmt.Println("Done!")
+	}()
+
+	h <- "Hello"
+	h <- "It's nice to see you"
+	h <- "I'll leave now"
 	close(h)
 
 	wg.Wait()
 
 	// Output:
-	// Hello from A
+	// Hello
 	// It's nice to see you
-	// Hello from B
+	// I'll leave now
 	// Done!
 }
 
 func Example_oneFromEachTopic() {
 	h := hub.New()
-	topics := map[string]hub.Topic{
-		"positiveNumbers": make(hub.Topic),
-		"negativeNumbers": make(hub.Topic),
-		"zeroes":          make(hub.Topic),
-	}
 	conn := make(hub.Conn)
+
+	h <- hub.ConnectEach{
+		Conn: conn,
+		Topics: []hub.TopicConn{
+			{Topic: "positiveNumbers", MessageCount: 1},
+			{Topic: "negativeNumbers", MessageCount: 1},
+			{Topic: "zeroes", MessageCount: 1},
+		},
+	}
+
 	wg := sync.WaitGroup{}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	worker := func(t hub.Topic, gen func() int) {
+	worker := func(topic string, gen func() int) {
 		defer wg.Done()
 
 		for {
@@ -78,7 +98,10 @@ func Example_oneFromEachTopic() {
 			case <-ctx.Done():
 				return
 			case <-time.After(time.Duration(rand.Intn(200)) * time.Millisecond):
-				t <- gen()
+				h <- hub.Message{
+					Message: gen(),
+					Topics:  []hub.Topic{topic},
+				}
 			}
 		}
 	}
@@ -109,26 +132,21 @@ func Example_oneFromEachTopic() {
 		}
 	}()
 
-	for _, t := range topics {
-		h <- t
-		t <- hub.Connect{Conn: conn, MessageCount: 1}
-	}
-
-	wg.Add(len(topics))
-	go worker(topics["positiveNumbers"], func() int {
+	wg.Add(3)
+	go worker("positiveNumbers", func() int {
 		return rand.Int() + 1
 	})
-	go worker(topics["negativeNumbers"], func() int {
+	go worker("negativeNumbers", func() int {
 		return -rand.Int() - 1
 	})
-	go worker(topics["zeroes"], func() int {
+	go worker("zeroes", func() int {
 		return 0
 	})
 
 	<-ctx.Done()
-	close(h)
-
 	wg.Wait()
+
+	close(h)
 
 	// Output:
 	// Received 3 messages
@@ -137,17 +155,12 @@ func Example_oneFromEachTopic() {
 	// One greater than 0
 }
 
-func ExampleReceiveNFromTopics() {
-	h := hub.New()
-	topicA, topicB := make(hub.Topic), make(hub.Topic)
-	// Registering topics
-	h <- topicA
-	h <- topicB
-	one := hub.ReceiveNFromTopics(1, topicA, topicB)
-	connAll := make(hub.Conn)
-	// Subscribing connection
-	topicA <- connAll
-	topicB <- connAll
+func Example_receiveNFromTopics() {
+	h, connAll, connOne := make(hub.Hub), make(hub.Conn), make(hub.Conn)
+
+	go h.Start()
+	h <- hub.Connect{Conn: connAll, Topics: []hub.Topic{"A", "B"}}
+	h <- hub.Connect{Conn: connOne, Topics: []hub.Topic{"A", "B"}, MessageCount: 1}
 
 	wg := sync.WaitGroup{}
 	connOneMsg := make(chan string, 1)
@@ -157,7 +170,7 @@ func ExampleReceiveNFromTopics() {
 	go func() {
 		defer wg.Done()
 
-		connOneMsg <- (<-one).(string)
+		connOneMsg <- (<-connOne).(string)
 
 		fmt.Println("connOne done! message received.")
 	}()
@@ -176,11 +189,11 @@ func ExampleReceiveNFromTopics() {
 		fmt.Println("connAll done! messages received.")
 	}()
 
-	topicA <- "Hello from A"
-	topicB <- "Hello from B"
-	topicA <- "Another message from A"
-	topicA <- "Still from A"
-	topicB <- "This message is your warning, hub will be closed"
+	h <- hub.Message{Message: "Hello from A", Topics: []hub.Topic{"A"}}
+	h <- hub.Message{Message: "Hello from B", Topics: []hub.Topic{"B"}}
+	h <- hub.Message{Message: "Another message from A", Topics: []hub.Topic{"A"}}
+	h <- hub.Message{Message: "Still from A", Topics: []hub.Topic{"A"}}
+	h <- hub.Message{Message: "This message is your warning, hub will be closed", Topics: []hub.Topic{"B"}}
 
 	close(h)
 	wg.Wait()
@@ -203,3 +216,5 @@ func ExampleReceiveNFromTopics() {
 	// connOne received a message connAll also received!
 	// connAll received 5/5 messages.
 }
+
+// TODO: Docs and tests
